@@ -6298,6 +6298,25 @@ class TestCppFakeTensorModeBindings(TestCase):
         storage = mode.from_tensor(alias).untyped_storage()
         self.assertEqual(storage._cdata, fake.untyped_storage()._cdata)
 
+    def test_fake_fallback_static_shape_decomps(self):
+        from torch._library.utils import lookup_op
+        from torch._meta_registrations import decomposes_under_static_shapes
+
+        contains = torch._C._fake_dispatch_contains_static_shape_decomp
+        self.assertTrue(contains("aten::log_sigmoid_forward", ""))
+        self.assertFalse(contains("aten::arange", "start"))
+
+        mismatched = set()
+        for name in torch._C._dispatch_get_all_op_names():
+            if not name.startswith("aten::"):
+                continue
+            op = lookup_op(name)
+            schema = op._schema
+            decomposes = decomposes_under_static_shapes(op)
+            if contains(schema.name, schema.overload_name) != decomposes:
+                mismatched.add(name)
+        self.assertEqual(mismatched, set())
+
     def test_require_python_fake_mode(self):
         from torch._guards import require_python_fake_mode
 

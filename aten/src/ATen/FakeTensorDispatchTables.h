@@ -8,11 +8,11 @@
 
 namespace at::impl {
 
-// C++-side copy of the Python decomp/meta/prims/op_impl registries
-// these are updated at Python registration sites
+// C++-side copy of the Python decomp/meta/prims/op_impl registries, and of the
+// ops FakeTensorMode decomposes under static shapes
 //
 // The tables are kept in sync by hooks at the Python registration sites, which
-// call fakeDispatchTableAdd/Remove:
+// call fakeDispatchTableAdd/Remove, except StaticShapeDecomp, filled once:
 //   - Decomp:   torch._decomp.decomposition_table (post-autograd
 //   decompositions),
 //               via torch._decomp._add_op_to_registry
@@ -27,6 +27,16 @@ namespace at::impl {
 //   - PrimMeta: prims ops that define a prim_meta_impl, via torch._prims
 //   - PythonCIA: Python CompositeImplicitAutograd overrides, via
 //                OpOverload.py_impl
+//   - StaticShapeDecomp: default static-shape decomposition eligibility,
+//                recorded once after torch._meta_registrations imports finish.
+//                Callers still check Meta membership and sparse inputs.
+//                This precise filter avoids declined Python callbacks while
+//                C++ follows Python's decomposition-selection policy.
+//                Assumes eligibility cannot grow after import: registrations,
+//                removals, direct dictionary writes and mode-method overrides
+//                are not mirrored. Stale positives can over-reject; missed
+//                additions can incorrectly reach Meta. The parity test checks
+//                the initial table only.
 //
 // This does not store the Python callables and is backed by c10::LeftRight
 enum class FakeDispatchCategory {
@@ -38,6 +48,7 @@ enum class FakeDispatchCategory {
   // for custom op handling registered through
   // torch.library.custom_op(...).register_fake
   CustomOpImpl,
+  StaticShapeDecomp,
   NumCategories
 };
 
@@ -49,7 +60,7 @@ inline uint32_t fakeDispatchCategoryBit(FakeDispatchCategory category) {
 }
 
 // Record/erase that `name` belongs to `category`. Called from the Python
-// registration hooks listed above.
+// registration hooks listed above, and once at import for StaticShapeDecomp.
 TORCH_API void fakeDispatchTableAdd(
     FakeDispatchCategory category,
     const c10::OperatorName& name);
