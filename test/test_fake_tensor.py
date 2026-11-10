@@ -6490,8 +6490,61 @@ class TestCppFakeTensorModeBindings(TestCase):
                 self.assertEqual(self._installed(), (mode, True))
         self.assertEqual(self._installed(), (None, False))
 
+        import threading
+
         meta = torch.eye(2).to_sparse().to("meta")
         sparse = torch._C._from_meta_and_device(meta, real.device, mode)
+        # _coalesced_ and add must run their sparse Meta kernels.
+        with torch._C._AutoDispatchBelowADInplaceOrView():
+            self.assertIs(torch.ops.aten._coalesced_(sparse, False), sparse)
+        self.assertFalse(sparse.is_coalesced())
+        # clone uses CompositeExplicitAutograd for COO.
+        cloned = sparse.clone()
+        # add's Meta kernel would make a dense output
+        added = sparse + sparse
+        for out in (cloned, added):
+            check(out, (2, 2))
+            self.assertTrue(out.is_sparse)
+        # with sparse invariant checks (which TestCase turns on) off, as Python
+        # does, but on this thread only
+        self.assertTrue(torch.sparse.check_sparse_tensor_invariants.is_enabled())
+        checks = []
+        thread_checks = []
+
+        def sparse_probe_meta(t):
+            checks.append(torch.sparse.check_sparse_tensor_invariants.is_enabled())
+            thread = threading.Thread(
+                target=lambda: thread_checks.append(
+                    torch.sparse.check_sparse_tensor_invariants.is_enabled()
+                )
+            )
+            thread.start()
+            thread.join()
+            return t.clone()
+
+        with torch.library._scoped_library("_test_fake_fallback_sparse", "DEF") as lib:
+            lib.define("probe(Tensor x) -> Tensor")
+            lib.impl("probe", sparse_probe_meta, "SparseMeta")
+            check(torch.ops._test_fake_fallback_sparse.probe(sparse), (2, 2))
+        self.assertEqual(checks, [False])
+        self.assertEqual(thread_checks, [True])
+        self.assertTrue(torch.sparse.check_sparse_tensor_invariants.is_enabled())
+        # Bypass ADInplaceOrView's own copies to check the fallback's copies.
+        with torch._C._AutoDispatchBelowADInplaceOrView():
+            meta_values, meta_indices = meta._values(), meta._indices()
+            values, indices = sparse._values(), sparse._indices()
+            check(values, meta_values.shape)
+            check(indices, meta_indices.shape)
+            self.assertIsNot(sparse._values(), values)
+            self.assertIsNot(sparse._indices(), indices)
+            values.resize_(5)
+            self.assertEqual(values.shape, (5,))
+            self.assertEqual(sparse._values().shape, meta_values.shape)
+            self.assertFalse(is_fake_tensor(meta_values))
+            self.assertFalse(is_fake_tensor(meta_indices))
+        csr_meta = torch.eye(2).to_sparse_csr().to("meta")
+        csr = torch._C._from_meta_and_device(csr_meta, real.device, mode)
+        check(csr.crow_indices(), csr_meta.crow_indices().shape)
         # Python runs silu's Python Meta registration rather than its
         # decomposition, as the fallback does
         self.assertTrue(
@@ -6528,7 +6581,9 @@ class TestCppFakeTensorModeBindings(TestCase):
             "ops with a Python fake implementation": lambda: x.view(6),
             "CompositeImplicitAutograd ops below autograd": lambda: x.reshape(6),
             "the Python dispatcher": under_python_dispatcher,
-            "sparse inputs": lambda: sparse + sparse,
+            "sparse inputs to ops without a sparse Meta kernel": lambda: torch.ops.aten.log_sigmoid_forward(
+                sparse
+            ),
             # Its decomposition checks the device, which reads meta here
             "ops Python decomposes": lambda: torch.ops.aten.log_sigmoid_forward(x),
         }
